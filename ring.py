@@ -15,27 +15,45 @@ import sys  # import sys package, if not already imported
 from ring_doorbell import Ring, Auth
 from oauthlib.oauth2 import MissingTokenError
 from _thread import start_new_thread, allocate_lock
+import argparse
+import pprint
+
+parser = argparse.ArgumentParser(description='Script that polls Ring.com API and informs FHEM in case of dings or motions.')
+parser.add_argument('--2fa', dest='twofa', help='the 2fa code')
+parser.add_argument('--ring-user', dest='ring_user', help='the ring username')
+parser.add_argument('--ring-pass', dest='ring_pass', help='the ring password')
+parser.add_argument('--fhem-ip', dest='fhem_ip', help='the fhem ip')
+parser.add_argument('--fhem-port', dest='fhem_port', help='the fhem telnet port')
+parser.add_argument('--log-level', dest='log_level', help='the log level')
+parser.add_argument('--fhem-path', dest='fhem_path', help='the fhem path for video downloads')
+parser.add_argument('--ring-poll-frequency', dest='ring_poll_frequency', help='the frequency to poll ring.com')
+parser.add_argument('--fhem-readings-updates', dest='fhem_readings_updates', help='the number of seconds to always update fhem readings')
+
+args = parser.parse_args()
+
 
 cache_file = Path("ring_token.cache")
 
 
-
 # CONFIG
-ring_user = 'user@foo.bar'
-ring_pass = 'password'
-fhem_ip   = '127.0.0.1'
-fhem_port = 7072 # Telnet Port
-log_level = logging.INFO
-fhem_path = '/opt/fhem/www/ring/' # for video downloads
-POLLS     = 2 # Poll every x seconds
-readingsUpdates = 120 # fhem readngs alle x Sek. aktualisieren
+if(not args.ring_user): args.ring_user = 'user@foo.bar'
+if(not args.ring_pass): args.ring_pass = 'password'
+if(not args.fhem_ip): args.fhem_ip   = '127.0.0.1'
+if(not args.fhem_port): args.fhem_port = 7072 # Telnet Port
+if(not args.log_level): args.log_level = logging.INFO
+elif(args.log_level == "DEBUG"): args.log_level = logging.DEBUG
+elif(args.log_level == "ERROR"): args.log_level = logging.ERROR
+else: args.log_level = loggging.INFO
+if(not args.fhem_path): args.fhem_path = '/opt/fhem/www/ring/' # for video downloads
+if(not args.ring_poll_frequency): args.ring_poll_frequency = 2 # Poll every x seconds
+if(not args.fhem_readings_updates): args.fhem_readings_updates = 120 # fhem readngs alle x Sek. aktualisieren
 
 # thread-related VARs
 # checkForVideoRunning = False # safeguard against race-condition
 
 # LOGGING
 logger = logging.getLogger('ring_doorbell.doorbot')
-logger.setLevel(log_level)
+logger.setLevel(args.log_level)
 
 # create file handler which logs even debug messages
 fh = logging.FileHandler('ring.log')
@@ -54,7 +72,7 @@ logger.addHandler(fh)
 logger.addHandler(ch)
 
 logger = logging.getLogger('fhem_ring')
-logger.setLevel(log_level)
+logger.setLevel(args.log_level)
 logger.addHandler(ch)
 logger.addHandler(fh)
 
@@ -64,14 +82,19 @@ def token_updated(token):
     cache_file.write_text(json.dumps(token))
 
 def otp_callback():
-    auth_code = input("2FA code: ")
+    if(args.twofa): 
+        auth_code = args.twofa
+        print("Use 2FA code: " + auth_code)
+    else: auth_code = input("Ring 2FA code: ")
     return auth_code
 
 if cache_file.is_file():
     auth = Auth("MyProject/1.0", json.loads(cache_file.read_text()), token_updated)
 else:
-    username = input("Username: ")
-    password = getpass.getpass("Password: ")
+    if(args.ring_user): username = args.ring_user
+    else: username = input("Ring Username: ")
+    if(args.ring_pass): password = args.ring_pass
+    else: password = getpass.getpass("Ring Password: ")
     auth = Auth("MyProject/1.0", None, token_updated)
     try:
         auth.fetch_token(username, password)
@@ -82,7 +105,7 @@ myring = Ring(auth)
 myring.update_data()
 
 
-fh = fhem.Fhem(fhem_ip, fhem_port)
+fh = fhem.Fhem(args.fhem_ip, args.fhem_port)
 
 def sendFhem(str):
     logger.debug("sending: " + str)
@@ -137,19 +160,16 @@ def getDeviceInfo(dev):
     srRing('ringVolume ' + str(dev.volume), dev)
     srRing('connectionStatus ' + str(dev.connection_status), dev)
 
-def pollDevices():
-    logger.info("Polling for events.")
-    global tmp
+def pollDevices(devices):
+    logger.info("Polling for events")
 
     waitsec = 0
     while 1:
-        for poll_device in tmp:
+        for poll_device in devices:
             try:
                 myring.update_dings()
-                # downloadSnapshot(poll_device)
                 logger.debug("Polling for events with '" + poll_device.name + "'.")
                 logger.debug("Connection status '" + poll_device.connection_status + "'.")
-                # logger.debug("Last URL: " + poll_device.recording_url(poll_device.last_recording_id))
 
                 if myring.dings_data:
                     getDeviceInfo(poll_device)
@@ -159,7 +179,7 @@ def pollDevices():
                     logger.info("Alert detected at '" + poll_device.name + "'.")
                     logger.debug("Alert detected at '" + poll_device.address + "' via '" + poll_device.name + "'.")
                     alertDevice(poll_device,dingsEvent,str(dingsEvent["state"]))
-                time.sleep(POLLS)
+                time.sleep(args.ring_poll_frequency)
                 # reset wait counter
                 waitsec = 0
             except Exception as inst:
@@ -175,15 +195,15 @@ def downloadLatestDingVideo(doorbell,lastAlertID,lastAlertKind):
     waitsec = 1
     while (videoIsReadyForDownload is None):
         try:
-            logger.debug("MP4 save path: "+str(fhem_path)+ 'last_'+str(lastAlertKind)+'_video.mp4')
+            logger.debug("MP4 save path: "+str(args.fhem_path)+ 'last_'+str(lastAlertKind)+'_video.mp4')
             doorbell.recording_download(
                 doorbell.last_recording_id,
-                filename=str(fhem_path) + 'last_'+str(lastAlertKind)+'_video.mp4',
+                filename=str(args.fhem_path) + 'last_'+str(lastAlertKind)+'_video.mp4',
                 override=True)
             logger.debug("Got "+str(doorbell.last_recording_id)+" video for Event "+str(lastAlertID)+
                 " from Ring api after "+str(waitsec)+"s")
             videoIsReadyForDownload = True
-            srRing('lastDingVideo ' + fhem_path + 'last_'+str(lastAlertKind)+'_video.mp4', poll_device)
+            srRing('lastDingVideo ' + args.fhem_path + 'last_'+str(lastAlertKind)+'_video.mp4', poll_device)
         except Exception as inst:
             logger.debug("Still waiting for event "+str(lastAlertID)+" to be ready...")
         time.sleep(1)
@@ -234,11 +254,10 @@ def alertDevice(poll_device,dingsEvent,alert):
         setRing('motion', poll_device)
 
     _thread.start_new_thread(getLastCaptureVideoURL,(poll_device,lastAlertID,lastAlertKind))
-    #_thread.start_new_thread(downloadLatestDingVideo,(poll_device,lastAlertID,lastAlertKind))
 
 def fhemReadingsUpdate(dev,sleepForSec):
     # fhem device update loop
-    while 1 > 0:
+    while 1:
         myring.update_data()
         getDeviceInfo(dev)
         downloadSnapshot(dev)
@@ -251,37 +270,32 @@ def downloadSnapshot(dev):
         snapshot = dev.get_snapshot()
         if snapshot:
             logger.debug("Snapshot: " + str(snapshot))
-            open(fhem_path + 'snap.png', "wb").write(snapshot)
+            open(args.fhem_path + 'snap.png', "wb").write(snapshot)
     except Exception as inst:
-        logger.info("No connection to ring API, continueing... ")
+        logger.debug(inst)
+        logger.info(dev.name + " has no connection to ring API, continueing... ")
         logger.info("Snapshot: " + str(snapshot))
 
 # GATHERING DEVICES
 devs = myring.devices()
-poll_device = None
 logger.debug("Devices: " + str(devs))
-tmp = list(devs['doorbots']+devs['authorized_doorbots'])
-logger.debug(tmp)
-for t in tmp:
+all_devices = list(devs['stickup_cams']+devs['doorbots']+devs['authorized_doorbots'])
+logger.info("Found " + str(len(all_devices)) + " devices.")
+logger.debug(all_devices)
+
+# Start readings update threads
+for t in all_devices:
     # start background fhemReadingsUpdate
-    _thread.start_new_thread(fhemReadingsUpdate,(t,readingsUpdates))
-
     t.update_health_data()
-    logger.debug(t.address)
-    # devs[t.id] = t
-    # all alerts can be recognized on all devices
-    poll_device = t # take one device for polling
+    _thread.start_new_thread(fhemReadingsUpdate,(t,args.fhem_readings_updates))
 
-logger.info("Found " + str(len(tmp)) + " devices.")
-getDeviceInfo(t)
 
 # START POLLING DEVICES
 count = 1
 while count<6:  # try 5 times
     try:
         while 1:
-            # for k, d in devs(): getDeviceInfo(d)
-            pollDevices()
+            pollDevices(all_devices)
 
     except Exception as inst:
         logger.error("Unexpected error:" + str(inst))
